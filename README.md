@@ -3,7 +3,7 @@
 
 ## BatteryPercent
 
-BatteryPercent is a tiny macOS menu bar app that shows your MacBook’s battery level as a clean number in the status bar.
+BatteryPercent is a tiny FOSS macOS menu bar app that shows your MacBook’s battery level as a clean number in the status bar.
 
 - Lightweight
 - Right‑click menu with:
