@@ -14,7 +14,7 @@ BatteryPercent is a tiny FOSS macOS menu bar app that shows your MacBook’s bat
 
 ## Installation
 
-1. Download the latest `BatteryPercent.dmg` from the
+1. Download the latest `BatteryPercent.zip` from the
    [Releases](https://github.com/ukuw/BatteryPercent/releases) page.
 2. Drag **BatteryPercent.app** to your **Applications** folder.
 3. Launch **BatteryPercent** from Applications.
