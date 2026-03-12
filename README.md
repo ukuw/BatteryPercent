@@ -32,11 +32,3 @@ BatteryPercent is a tiny macOS menu bar app that shows your MacBook’s battery 
 5. The battery percentage will appear in the menu bar.
 
 If macOS warns about an unidentified developer, open **System Settings → Privacy & Security** and allow the app to run.
-
-## Building from source
-
-1. Clone the repository:
-
-   ```bash
-   git clone https://github.com/ukuw/BatteryPercent.git
-   cd BatteryPercent
