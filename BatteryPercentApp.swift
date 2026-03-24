@@ -21,7 +21,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let statusMenu = NSMenu()
 
-    // Launch-at-login status using SMAppService (macOS 13+)[web:95][web:101]
+    // MARK: - UserDefaults Keys
+    private let kChargeLimit80Key = "chargeLimit80Enabled"
+    private let kBatterySaverKey  = "batterySaverEnabled"
+
+    // MARK: - Persisted Toggles
+    private var chargeLimit80Enabled: Bool {
+        get { UserDefaults.standard.bool(forKey: kChargeLimit80Key) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: kChargeLimit80Key)
+            applyChargeLimit(newValue)
+        }
+    }
+
+    private var batterySaverEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: kBatterySaverKey) }
+        set {
+            UserDefaults.standard.set(newValue, forKey: kBatterySaverKey)
+            applyBatterySaver(newValue)
+        }
+    }
+
+    // MARK: - Launch-at-login status using SMAppService (macOS 13+)
     private var launchAtLoginEnabled: Bool {
         get {
             if #available(macOS 13.0, *) {
@@ -48,6 +69,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+
+        // Re-apply persisted settings on launch
+        if chargeLimit80Enabled { applyChargeLimit(true) }
+        if batterySaverEnabled  { applyBatterySaver(true) }
 
         setupMenu()
         updateBattery()
@@ -90,6 +115,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusMenu.addItem(NSMenuItem.separator())
 
+        // --- Battery section header (disabled label) ---
+        let batteryHeader = NSMenuItem(title: "Battery", action: nil, keyEquivalent: "")
+        batteryHeader.isEnabled = false
+        statusMenu.addItem(batteryHeader)
+
+        // Limit Charging to 80%
+        let chargeLimitItem = NSMenuItem(
+            title: "Limit Charging to 80%",
+            action: #selector(toggleChargeLimit(_:)),
+            keyEquivalent: ""
+        )
+        chargeLimitItem.state = chargeLimit80Enabled ? .on : .off
+        chargeLimitItem.target = self
+        chargeLimitItem.toolTip = "Uses pmset to cap charging at 80% (Apple Silicon). Helps preserve long-term battery health."
+        statusMenu.addItem(chargeLimitItem)
+
+        // Battery Saver (Low Power Mode)
+        let batterySaverItem = NSMenuItem(
+            title: "Battery Saver (Low Power Mode)",
+            action: #selector(toggleBatterySaver(_:)),
+            keyEquivalent: ""
+        )
+        batterySaverItem.state = batterySaverEnabled ? .on : .off
+        batterySaverItem.target = self
+        batterySaverItem.toolTip = "Enables macOS Low Power Mode via pmset to extend battery life."
+        statusMenu.addItem(batterySaverItem)
+
+        statusMenu.addItem(NSMenuItem.separator())
+
         // About / Website
         let aboutItem = NSMenuItem(
             title: "About / Website",
@@ -122,15 +176,58 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenu.addItem(quitItem)
     }
 
+    // MARK: - Toggle Actions
+
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
         let newValue = sender.state != .on
         launchAtLoginEnabled = newValue
         sender.state = newValue ? .on : .off
     }
 
+    @objc private func toggleChargeLimit(_ sender: NSMenuItem) {
+        let newValue = sender.state != .on
+        chargeLimit80Enabled = newValue
+        sender.state = newValue ? .on : .off
+    }
+
+    @objc private func toggleBatterySaver(_ sender: NSMenuItem) {
+        let newValue = sender.state != .on
+        batterySaverEnabled = newValue
+        sender.state = newValue ? .on : .off
+    }
+
+    // MARK: - pmset Helpers
+
+    /// Sets the macOS battery charge limit to 80% (Apple Silicon) or removes the limit.
+    /// Requires administrator privileges; prompts via osascript if needed.
+    private func applyChargeLimit(_ enable: Bool) {
+        let value = enable ? "80" : "100"
+        // pmset -a BATT_CHARGE_LIMIT <value> requires sudo
+        runPrivilegedShell("pmset -a BATT_CHARGE_LIMIT \(value)")
+    }
+
+    /// Enables or disables macOS Low Power Mode via pmset.
+    private func applyBatterySaver(_ enable: Bool) {
+        let flag = enable ? "1" : "0"
+        runPrivilegedShell("pmset -a lowpowermode \(flag)")
+    }
+
+    /// Runs a shell command with administrator privileges using osascript.
+    private func runPrivilegedShell(_ command: String) {
+        let escaped = command.replacingOccurrences(of: "\"", with: "\\\"")
+        let script  = "do shell script \"\(escaped)\" with administrator privileges"
+        var error: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&error)
+        if let err = error {
+            NSLog("BatteryPercent: privileged command failed: %@", err)
+        }
+    }
+
+    // MARK: - Website / Uninstall / Quit
+
     @objc private func openWebsite() {
         if let url = URL(string: "https://ukuw.github.io") {
-            NSWorkspace.shared.open(url)   // open in default browser[web:88][web:97]
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -145,10 +242,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn else { return }
 
-        // Best effort: disable launch at login first
         launchAtLoginEnabled = false
 
-        // Move the app bundle to Trash, like Finder does[web:107][web:110][web:116]
         let fileManager = FileManager.default
         let appURL = Bundle.main.bundleURL
 
