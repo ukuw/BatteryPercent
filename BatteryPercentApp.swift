@@ -1,15 +1,13 @@
 import SwiftUI
 import IOKit.ps
-import ServiceManagement   // for SMAppService (launch at login)
+import ServiceManagement // for SMAppService (launch at login)
 
 @main
 struct BatteryPercentApp: App {
-
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
     var body: some Scene {
         Settings {
-            EmptyView()   // no visible window
+            EmptyView() // no visible window
         }
     }
 }
@@ -18,7 +16,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     var statusItem: NSStatusItem!
     let updateInterval: TimeInterval = 10.0
-
     private let statusMenu = NSMenu()
 
     // MARK: - UserDefaults Keys
@@ -72,10 +69,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Re-apply persisted settings on launch
         if chargeLimit80Enabled { applyChargeLimit(true) }
-        if batterySaverEnabled  { applyBatterySaver(true) }
+        // Sync battery saver state from system on launch
+        let sysBatterySaver = currentLowPowerModeState()
+        if sysBatterySaver != batterySaverEnabled {
+            UserDefaults.standard.set(sysBatterySaver, forKey: kBatterySaverKey)
+        }
 
         setupMenu()
         updateBattery()
+
+        // Also observe LPM changes from outside the app (Notification Center)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(powerStateChanged),
+            name: NSNotification.Name(rawValue: "com.apple.system.lowpowermode"),
+            object: nil
+        )
 
         Timer.scheduledTimer(timeInterval: updateInterval,
                              target: self,
@@ -88,13 +97,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func statusItemClicked(_ sender: NSStatusBarButton) {
         guard let event = NSApp.currentEvent else { return }
-
         if event.type == .rightMouseUp || event.modifierFlags.contains(.control) {
             statusItem.menu = statusMenu
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
         } else {
-            // Left click: no action for now
+            // Left click: no action
         }
     }
 
@@ -115,7 +123,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusMenu.addItem(NSMenuItem.separator())
 
-        // --- Battery section header (disabled label) ---
+        // --- Battery section header ---
         let batteryHeader = NSMenuItem(title: "Battery", action: nil, keyEquivalent: "")
         batteryHeader.isEnabled = false
         statusMenu.addItem(batteryHeader)
@@ -128,18 +136,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         chargeLimitItem.state = chargeLimit80Enabled ? .on : .off
         chargeLimitItem.target = self
-        chargeLimitItem.toolTip = "Uses pmset to cap charging at 80% (Apple Silicon). Helps preserve long-term battery health."
+        chargeLimitItem.toolTip = "Uses the 'battery' CLI (actuallymentor/battery) to cap charging at 80%. Requires installation on first use."
         statusMenu.addItem(chargeLimitItem)
 
         // Battery Saver (Low Power Mode)
+        let lpmState = currentLowPowerModeState()
         let batterySaverItem = NSMenuItem(
             title: "Battery Saver (Low Power Mode)",
             action: #selector(toggleBatterySaver(_:)),
             keyEquivalent: ""
         )
-        batterySaverItem.state = batterySaverEnabled ? .on : .off
+        batterySaverItem.state = lpmState ? .on : .off
         batterySaverItem.target = self
-        batterySaverItem.toolTip = "Enables macOS Low Power Mode via pmset to extend battery life."
+        batterySaverItem.toolTip = "Toggles macOS Low Power Mode. Creates a sudoers rule at /private/etc/sudoers.d/lowpowermode on first use so no password is needed."
         statusMenu.addItem(batterySaverItem)
 
         statusMenu.addItem(NSMenuItem.separator())
@@ -196,31 +205,118 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sender.state = newValue ? .on : .off
     }
 
-    // MARK: - pmset Helpers
+    // MARK: - LPM state observer
 
-    /// Sets the macOS battery charge limit to 80% (Apple Silicon) or removes the limit.
-    /// Requires administrator privileges; prompts via osascript if needed.
-    private func applyChargeLimit(_ enable: Bool) {
-        let value = enable ? "80" : "100"
-        // pmset -a BATT_CHARGE_LIMIT <value> requires sudo
-        runPrivilegedShell("pmset -a BATT_CHARGE_LIMIT \(value)")
+    @objc private func powerStateChanged(_ notification: Notification) {
+        let lpmState = currentLowPowerModeState()
+        UserDefaults.standard.set(lpmState, forKey: kBatterySaverKey)
+        setupMenu() // refresh checkmarks
     }
 
-    /// Enables or disables macOS Low Power Mode via pmset.
-    private func applyBatterySaver(_ enable: Bool) {
-        let flag = enable ? "1" : "0"
-        runPrivilegedShell("pmset -a lowpowermode \(flag)")
+    // MARK: - Charging Limit via 'battery' CLI (actuallymentor/battery)
+    // Repo: https://github.com/actuallymentor/battery
+    // Install: curl -s https://raw.githubusercontent.com/actuallymentor/battery/main/setup.sh | bash
+    // Usage:   battery maintain 80   /   battery maintain stop
+
+    private func isBatteryCLIInstalled() -> Bool {
+        return FileManager.default.fileExists(atPath: "/usr/local/bin/battery")
     }
 
-    /// Runs a shell command with administrator privileges using osascript.
-    private func runPrivilegedShell(_ command: String) {
-        let escaped = command.replacingOccurrences(of: "\"", with: "\\\"")
-        let script  = "do shell script \"\(escaped)\" with administrator privileges"
+    private func installBatteryCLI() {
+        // Runs the one-line installer from actuallymentor/battery via privileged shell
+        let script = """
+        do shell script "curl -s https://raw.githubusercontent.com/actuallymentor/battery/main/setup.sh | bash" with administrator privileges
+        """
         var error: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&error)
         if let err = error {
-            NSLog("BatteryPercent: privileged command failed: %@", err)
+            NSLog("BatteryPercent: battery CLI install failed: %@", err)
         }
+    }
+
+    private func applyChargeLimit(_ enable: Bool) {
+        if enable {
+            if !isBatteryCLIInstalled() {
+                // Prompt user before installing
+                let alert = NSAlert()
+                alert.messageText = "Install 'battery' CLI?"
+                alert.informativeText = "Limiting charging to 80% requires the 'battery' command-line tool by actuallymentor. It will be downloaded and installed now (requires admin password)."
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "Install")
+                alert.addButton(withTitle: "Cancel")
+                let response = alert.runModal()
+                guard response == .alertFirstButtonReturn else {
+                    // User cancelled – revert pref
+                    UserDefaults.standard.set(false, forKey: kChargeLimit80Key)
+                    setupMenu()
+                    return
+                }
+                installBatteryCLI()
+            }
+            runShell("/usr/local/bin/battery maintain 80")
+        } else {
+            if isBatteryCLIInstalled() {
+                runShell("/usr/local/bin/battery maintain stop")
+            }
+        }
+    }
+
+    // MARK: - Low Power Mode via sudoers + pmset
+    // Method: create /private/etc/sudoers.d/lowpowermode on first use,
+    // then use sudo pmset to toggle LPM without password.
+    // Approach mirrors https://github.com/nift4/BatterySaverToggle
+
+    private let sudoersPath = "/private/etc/sudoers.d/lowpowermode"
+    private let sudoersRule = "ALL ALL=(ALL) NOPASSWD: /usr/bin/pmset -a lowpowermode *\n"
+
+    private func ensureSudoersRule() {
+        guard !FileManager.default.fileExists(atPath: sudoersPath) else { return }
+
+        // Write sudoers rule via privileged AppleScript (one-time setup)
+        // The rule allows anyone on the machine to change LPM state only
+        let rule = sudoersRule
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n")
+
+        let script = """
+        do shell script "echo -n \\"\\(rule)\\" | sudo tee /private/etc/sudoers.d/lowpowermode > /dev/null && sudo chmod 440 /private/etc/sudoers.d/lowpowermode" with administrator privileges
+        """
+        var error: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&error)
+        if let err = error {
+            NSLog("BatteryPercent: sudoers setup failed: %@", err)
+        }
+    }
+
+    private func applyBatterySaver(_ enable: Bool) {
+        ensureSudoersRule()
+        let flag = enable ? "1" : "0"
+        // After sudoers rule exists, sudo pmset needs no password
+        runShell("sudo /usr/bin/pmset -a lowpowermode \(flag)")
+        setupMenu() // refresh checkmark to reflect real state
+    }
+
+    /// Reads the actual current Low Power Mode state from pmset
+    private func currentLowPowerModeState() -> Bool {
+        let task = Process()
+        task.launchPath = "/usr/bin/pmset"
+        task.arguments = ["-g"]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        try? task.run()
+        task.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return output.contains("lowpowermode              1")
+    }
+
+    // MARK: - Generic shell runner (no privilege escalation)
+
+    private func runShell(_ command: String) {
+        let task = Process()
+        task.launchPath = "/bin/bash"
+        task.arguments = ["-c", command]
+        try? task.run()
+        task.waitUntilExit()
     }
 
     // MARK: - Website / Uninstall / Quit
@@ -238,7 +334,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Uninstall")
         alert.addButton(withTitle: "Cancel")
-
         let response = alert.runModal()
         guard response == .alertFirstButtonReturn else { return }
 
@@ -246,13 +341,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let fileManager = FileManager.default
         let appURL = Bundle.main.bundleURL
-
         do {
             try fileManager.trashItem(at: appURL, resultingItemURL: nil)
         } catch {
-            // If this fails, we just quit without uninstalling
+            // If this fails, just quit
         }
-
         NSApp.terminate(self)
     }
 
@@ -263,25 +356,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Battery
 
     @objc func updateBattery() {
-        let percentage = getBatteryPercentage()
-        statusItem.button?.title = "\(percentage)%"
+        let (percentage, isCharging, isPlugged) = getBatteryState()
+        var title = "\(percentage)%"
+        // Show charging/plugged indicator only when NOT running on battery.
+        // No emoji, no icon – plain text only.
+        if isCharging {
+            title += " (Charging)"
+        } else if isPlugged {
+            title += " (Plugged in)"
+        }
+        // On battery: percentage only, no indicator appended
+        statusItem.button?.title = title
     }
 
-    private func getBatteryPercentage() -> Int {
+    /// Returns (percentage, isCharging, isPluggedIn)
+    private func getBatteryState() -> (Int, Bool, Bool) {
         guard
-            let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-            let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef],
-            let source = sources.first,
+            let snapshot    = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+            let sources     = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [CFTypeRef],
+            let source      = sources.first,
             let description = IOPSGetPowerSourceDescription(snapshot, source)?
-                .takeUnretainedValue() as? [String: Any],
-            let capacity = description[kIOPSCurrentCapacityKey as String] as? Int,
+                                .takeUnretainedValue() as? [String: Any],
+            let capacity    = description[kIOPSCurrentCapacityKey as String] as? Int,
             let maxCapacity = description[kIOPSMaxCapacityKey as String] as? Int,
             maxCapacity > 0
         else {
-            return 100
+            return (100, false, false)
         }
 
-        let percent = Int((Double(capacity) / Double(maxCapacity)) * 100.0)
-        return Swift.max(0, Swift.min(100, percent))
+        let percent     = Swift.max(0, Swift.min(100, Int((Double(capacity) / Double(maxCapacity)) * 100.0)))
+
+        // kIOPSPowerSourceStateKey: "AC Power" = plugged in, "Battery Power" = on battery
+        let powerSource = description[kIOPSPowerSourceStateKey as String] as? String ?? ""
+        let isPlugged   = (powerSource == kIOPSACPowerValue as String)
+
+        // kIOPSIsChargingKey: true when actively charging
+        let isCharging  = (description[kIOPSIsChargingKey as String] as? Bool) ?? false
+
+        return (percent, isCharging, isPlugged)
     }
 }
