@@ -253,10 +253,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 installBatteryCLI()
             }
-            runShell("/usr/local/bin/battery maintain 80")
+            runPrivileged("/usr/local/bin/battery maintain 80")
         } else {
             if isBatteryCLIInstalled() {
-                runShell("/usr/local/bin/battery maintain stop")
+                runPrivileged("/usr/local/bin/battery maintain stop")
             }
         }
     }
@@ -279,7 +279,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .replacingOccurrences(of: "\n", with: "\\n")
 
         let script = """
-        do shell script "echo -n \\"\\(rule)\\" | sudo tee /private/etc/sudoers.d/lowpowermode > /dev/null && sudo chmod 440 /private/etc/sudoers.d/lowpowermode" with administrator privileges
+        do shell script "echo -n \\\"\\(rule)\\\" | sudo tee /private/etc/sudoers.d/lowpowermode > /dev/null && sudo chmod 440 /private/etc/sudoers.d/lowpowermode" with administrator privileges
         """
         var error: NSDictionary?
         NSAppleScript(source: script)?.executeAndReturnError(&error)
@@ -291,12 +291,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyBatterySaver(_ enable: Bool) {
         ensureSudoersRule()
         let flag = enable ? "1" : "0"
-        // After sudoers rule exists, sudo pmset needs no password
-        runShell("sudo /usr/bin/pmset -a lowpowermode \(flag)")
+        // Use privileged AppleScript to avoid "Operation not permitted" from Process()
+        runPrivileged("sudo /usr/bin/pmset -a lowpowermode \(flag)")
         setupMenu() // refresh checkmark to reflect real state
     }
 
-    /// Reads the actual current Low Power Mode state from pmset
+    /// Reads the actual current Low Power Mode state from pmset (read-only, no privilege needed)
     private func currentLowPowerModeState() -> Bool {
         let task = Process()
         task.launchPath = "/usr/bin/pmset"
@@ -309,14 +309,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return output.contains("lowpowermode              1")
     }
 
-    // MARK: - Generic shell runner (no privilege escalation)
+    // MARK: - Privileged shell runner via NSAppleScript
+    // Avoids "Operation not permitted" when spawning /bin/bash or /usr/bin/sudo
+    // directly via Process() under Hardened Runtime / App Sandbox.
 
-    private func runShell(_ command: String) {
-        let task = Process()
-        task.launchPath = "/bin/bash"
-        task.arguments = ["-c", command]
-        try? task.run()
-        task.waitUntilExit()
+    private func runPrivileged(_ command: String) {
+        let escaped = command
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let script = "do shell script \"\(escaped)\" with administrator privileges"
+        var error: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&error)
+        if let err = error {
+            NSLog("BatteryPercent: privileged shell failed: %@", err)
+        }
     }
 
     // MARK: - Website / Uninstall / Quit
